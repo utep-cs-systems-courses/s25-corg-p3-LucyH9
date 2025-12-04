@@ -1,126 +1,112 @@
 #include "toy.h"
+
+// ----------------------------
+// Define state here to fix linker
 volatile uint8_t state = IDLE;
-//Initialize
+
+// ----------------------------
+// LED blink timing
+volatile unsigned int blink_counter = 0;
+unsigned int blink_threshold = 50; // default
+
+// ----------------------------
+// Initialize hardware
 void init_hardware(void)
 {
-    WDTCTL = WDTPW | WDTHOLD;   // Stop watchdog timer
+    WDTCTL = WDTPW | WDTHOLD; // Stop watchdog
 
-    // Configure LED pins
-    P1DIR |= (LED_RED | LED_GREEN);  // Output
-    P1SEL |= LED_GREEN;              // P1.6 = TA0.1 output for PWM
+    // LEDs
+    P1DIR |= LED_RED | LED_GREEN;
     P1OUT &= ~(LED_RED | LED_GREEN);
 
-    // Configure buttons P2.0–P2.3 with pull-ups and interrupts
-    P2DIR &= ~(BTN0 | BTN1 | BTN2 | BTN3);
-    P2REN |=  (BTN0 | BTN1 | BTN2 | BTN3);
-    P2OUT |=  (BTN0 | BTN1 | BTN2 | BTN3);
-    P2IES |=  (BTN0 | BTN1 | BTN2 | BTN3); // falling edge
-    P2IFG  =  0; // clear flags
-    P2IE  |=  (BTN0 | BTN1 | BTN2 | BTN3);
+    // Buttons
+    init_buttons();
 
-    // Timer0_A for LED PWM (P1.6)
-    TA0CCR0 = 1000;               // PWM period
-    TA0CCTL1 = OUTMOD_7;          // Reset/set mode
-    TA0CCR1 = 200;                // Initial brightness (dim)
-    TA0CTL = TASSEL__SMCLK | MC__UP | TACLR;
+    // Timer for blinking
+    init_timer();
 
-    // Timer1_A for speaker PWM (P2.6, optional — connect speaker to P2.6)
-    P2DIR |= BIT6;
-    P2SEL |= BIT6;
-    TA1CCR0 = 0;   // Off by default
-    TA1CCTL1 = OUTMOD_7;
-    TA1CCR1 = 0;
-    TA1CTL = TASSEL__SMCLK | MC__UP | TACLR;
+    __bis_SR_register(GIE); // Enable global interrupts
 }
 
-//LED and Sound Functions
-// Simple brightness control (change duty cycle)
-void set_led_brightness(uint8_t bright)
+// ----------------------------
+// Initialize buttons with interrupts
+void init_buttons(void)
 {
-    if (bright)
-        TA0CCR1 = 800;   // bright
-    else
-        TA0CCR1 = 200;   // dim
+    // BTN0: P1.3 (next pattern)
+    P1DIR &= ~BTN0;
+    P1REN |= BTN0;
+    P1OUT |= BTN0;
+    P1IES |= BTN0;    // High-to-low edge
+    P1IFG &= ~BTN0;
+    P1IE |= BTN0;
+
+    // BTN1: P2.3 (previous pattern)
+    P2DIR &= ~BTN1;
+    P2REN |= BTN1;
+    P2OUT |= BTN1;
+    P2IES |= BTN1;
+    P2IFG &= ~BTN1;
+    P2IE |= BTN1;
 }
 
-// Flash patterns
-void set_led_pattern_fast(void)
+// ----------------------------
+// Initialize Timer_A0
+void init_timer(void)
 {
-    P1OUT ^= LED_RED;
-    __delay_cycles(100000);
+    TA0CCR0 = 32768 / 100;            // base interval ~10ms
+    TA0CCTL0 = CCIE;                  // enable interrupt
+    TA0CTL = TASSEL_1 | MC_1 | TACLR; // ACLK, up mode
 }
 
-void set_led_pattern_slow(void)
+// ----------------------------
+// Timer ISR: handle LED blinking
+#pragma vector = TIMER0_A0_VECTOR
+__interrupt void Timer_A0_ISR(void)
 {
-    P1OUT ^= LED_RED;
-    __delay_cycles(300000);
+    blink_counter++;
+
+    // Set blink speed based on current state
+    switch(state) {
+        case FLASH_FAST:  blink_threshold = 25; break;
+        case FLASH_SLOW:  blink_threshold = 75; break;
+        case FREERUN:     blink_threshold = 50; break;
+        default:          blink_threshold = 500; break; // IDLE
+    }
+
+    if (blink_counter >= blink_threshold) {
+        blink_counter = 0;
+        if(state != IDLE) {
+            P1OUT ^= LED_RED;
+            P1OUT ^= LED_GREEN;
+        }
+    }
 }
 
-// Idle state: both LEDs off
-void do_idle(void)
+// ----------------------------
+// Button ISRs
+#pragma vector=PORT1_VECTOR
+__interrupt void Port1_ISR(void)
 {
-    P1OUT &= ~(LED_RED);
-    TA0CCR1 = 0;
+    if(P1IFG & BTN0) {  // Next pattern
+        if(state >= FREERUN) state = IDLE;
+        else state++;
+        P1IFG &= ~BTN0;
+    }
 }
 
-// Random / fun mode
-void do_random_effects(void)
+#pragma vector=PORT2_VECTOR
+__interrupt void Port2_ISR(void)
 {
-    P1OUT ^= LED_RED;
-    set_led_brightness((P1OUT & LED_RED) ? 1 : 0);
-    TA1CCR0 = 500 + (rand() % 5000);
-    TA1CCR1 = TA1CCR0 / 2;
-    __delay_cycles(100000);
+    if(P2IFG & BTN1) {  // Previous pattern
+        if(state == IDLE) state = FREERUN;
+        else state--;
+        P2IFG &= ~BTN1;
+    }
 }
 
-//Sound
-void play_tone(unsigned int freq, unsigned int duration_ms)
-{
-    unsigned int period = 1000000 / freq;   
-    TA1CCR0 = period;
-    TA1CCR1 = period / 2;
-    __delay_cycles(duration_ms * 1000);
-    TA1CCR0 = 0;   // stop tone
-    TA1CCR1 = 0;
-}
-
-void play_melody(void)
-{
-    play_tone(NOTE_C4, 200);
-    play_tone(NOTE_E4, 200);
-    play_tone(NOTE_G4, 200);
-    play_tone(NOTE_C5, 400);
-}
-
-//State Machines
-
+// ----------------------------
+// update_state: empty because buttons control state
 void update_state(void)
 {
-    switch (state) {
-        case IDLE:        do_idle(); break;
-        case PLAY_TUNE:   play_melody(); break;
-        case FLASH_FAST:  set_led_pattern_fast(); break;
-        case FLASH_SLOW:  set_led_pattern_slow(); break;
-        case FREERUN:     do_random_effects(); break;
-        default:           state = IDLE; break;
-    }
-}
-
-//Buttons
-#pragma vector=PORT2_VECTOR
-__interrupt void Port_2(void)
-{
-    if (P2IFG & BTN0) {
-        asm_next_state();   // Advance state in assembly
-    }
-    if (P2IFG & BTN1) {
-        state = (state == 0) ? NUM_STATES - 1 : state - 1; // back
-    }
-    if (P2IFG & BTN2) {
-        play_melody(); // manual play
-    }
-    if (P2IFG & BTN3) {
-        state = FREERUN;
-    }
-    P2IFG = 0; // clear flags
+    // No automatic state update
 }
